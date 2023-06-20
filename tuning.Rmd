@@ -1,0 +1,463 @@
+---
+title: "tuning"
+author: "aymen"
+date: "2023-06-12"
+output: html_document
+---
+
+## **library**
+
+```{r}
+library(tidymodels)
+library(themis)
+library(ggplot2)
+library(yardstick)
+```
+
+## **data import and process**
+
+```{r}
+data <- read.csv("Churn_data.csv", na.strings = c("", "NA", "N/A"))
+
+data <- data %>% 
+  mutate(Churn = as.factor(Churn))
+
+data <- data %>%
+  drop_na()
+
+
+data <- data %>%
+  select(-Subs_id, -Mr, -Wilaya) 
+
+
+#creating new variable 
+
+data <- data %>%
+  mutate(offers = case_when(
+    grepl("prepaid", Global_Profile, ignore.case = TRUE) & grepl("2G", Global_Profile) ~ "prepaid 2G",
+    grepl("prepaid", Global_Profile, ignore.case = TRUE) & grepl("3G", Global_Profile) ~ "prepaid 3G",
+    grepl("prepaid", Global_Profile, ignore.case = TRUE) & grepl("4G", Global_Profile) ~ "prepaid 4G",
+    grepl("postpaid", Global_Profile, ignore.case = TRUE) & grepl("2G", Global_Profile) ~ "postpaid 2G",
+    grepl("postpaid", Global_Profile, ignore.case = TRUE) & grepl("3G", Global_Profile) ~ "postpaid 3G",
+    grepl("postpaid", Global_Profile, ignore.case = TRUE) & grepl("4G", Global_Profile) ~ "postpaid 4G",
+    TRUE ~ "reste"
+  ))
+
+#removing the old variable
+data <- data %>%
+  select(-Global_Profile, -Age_Years) 
+
+glimpse(data)
+```
+
+## **split the model into training and testing set**
+
+```{r}
+set.seed(123)  # Set a seed for reproducibility
+data_split <- initial_split(data, prop = 0.8)  # 80% for training, 20% for testing
+data_train <- training(data_split)
+data_test <- testing(data_split)
+
+data %>% count(Churn)
+data_train %>% count(Churn)
+```
+
+## **recipe**
+
+```{r}
+# data_train$Churn <- as.factor(data_train$Churn) 
+
+data_recipe <- recipe(Churn ~ ., data = data_train) %>%
+  step_upsample(Churn, over_ratio = 1) %>%
+  step_normalize(all_numeric(), -code_wilaya, -all_outcomes())%>%
+    step_other(Behavior_Segments, threshold = 0.07) %>%
+  step_other(Value_Segment, threshold = 0.06) %>%
+  step_other(Devicetype, threshold = 0.01) %>%
+  step_dummy(all_nominal(), -all_outcomes(), one_hot = TRUE) 
+
+
+data_transformed <- data_recipe %>% prep(data_train) %>% juice() 
+
+table(data_transformed$Churn)
+
+ data_transformed
+ # Specify the target variable and all predictors
+ggplot(data_transformed, aes(x = Churn, y = jitter(seq_len(nrow(data_transformed)), amount = 0.3), color = Churn)) +
+  geom_jitter(width = 0.2, height = 0.1) +
+  labs(x = "Churn", y = "", color = "Churn") +
+  scale_color_manual(values = c("blue", "red")) +
+  theme_bw()
+
+
+
+
+```
+```{r}
+glimpse(data_transformed)
+```
+applying model without tuning
+```{r}
+xgb_model0 <- boost_tree(
+
+) %>%
+  set_engine("xgboost")%>%
+  set_mode("classification")
+
+```
+ workflow
+```{r}
+xgb_wf0 <- workflow() %>%
+  add_model(xgb_model0) %>%
+  add_recipe(data_recipe)
+
+```
+ fitting
+```{r}
+xgb_fit0 <- xgb_wf0  %>% last_fit(data_split)
+xgb_fit0 %>% collect_metrics(accuracy, roc_auc)
+```
+```{r}
+library(vip)
+library(vip)
+
+vip(xgb_fit0 %>% extract_fit_parsnip(), geom = "point", num_features = 12) +
+  theme_bw()
+
+
+
+
+
+```
+
+ confusion mtx
+```{r}
+collect_predictions(xgb_fit0) %>% 
+  conf_mat(Churn, .pred_class) %>% 
+  pluck(1) %>%
+  as_tibble() %>%
+  ggplot(aes(Truth, Prediction, alpha = n)) +
+  geom_tile(show.legend = FALSE, fill = "blue") +
+  geom_text(aes(label = n), colour = "#2F423D", alpha = 1, size = 7) +
+  scale_x_discrete(position = "top", limits = c("1","0"))
+
+```
+ courbe roc
+```{r}
+default_auc<-
+  collect_predictions(xgb_fit0) %>% 
+  roc_curve(Churn, .pred_0)
+
+autoplot(default_auc)
+```
+ 
+
+## **apply model**
+
+```{r}
+xgb_model <- boost_tree(
+  mode = "classification",
+  trees = tune(),
+  tree_depth = tune(),
+  learn_rate = tune(),
+  min_n = tune(),
+  mtry = tune()
+) %>%
+  set_engine("xgboost")
+
+
+```
+
+## **create workflow**
+
+```{r}
+xgb_wf <- workflow() %>%
+  add_model(xgb_model) %>%
+  add_recipe(data_recipe)
+
+```
+
+grid search
+
+```{r}
+#grid <- grid_regular(
+  #trees(range = c(50, 500)),
+  #tree_depth(range = c(3, 8)),
+  #learn_rate(range = c(0.01, 0.2)),
+  #min_n(range = c(5, 20)),
+  #levels = 5
+#)
+
+```
+
+## **tune bays function**
+
+```{r}
+# Specify initial tuning parameters
+doParallel::registerDoParallel(cores = 8)
+
+xgb_param = xgb_wf %>% 
+  extract_parameter_set_dials() %>% 
+  update(mtry = mtry(c(5,20)))
+
+ctrl <- control_bayes(verbose = TRUE, no_improve = 10)
+set.seed(123)
+
+xgb_tuned <- tune_bayes(
+  xgb_wf,param_info = xgb_param,
+  resamples = vfold_cv(data_train, v = 5, strata = Churn),
+  initial = 10,
+  iter = 30,
+  control = ctrl
+
+)
+
+
+
+```
+
+collect best tune
+
+```{r}
+best <- xgb_tuned %>% select_best(metric ="accuracy")
+best
+
+#finalize wf
+xgb_wf2 <- xgb_wf %>% finalize_workflow(best)
+xgb_wf2
+
+
+```
+model fitting result 
+```{r}
+xgb_fit <- xgb_wf2 %>% last_fit(data_split)
+xgb_fit %>% collect_metrics(metrics = metric_set(roc_auc, accuracy, f_meas))
+```
+```{r}
+autoplot(xgb_tuned)
+autoplot(xgb_tuned, type = "performance")
+```
+
+```{r}
+collect_predictions(xgb_fit)
+```
+
+```{r}
+collect_predictions(xgb_fit) %>% 
+  conf_mat(Churn, .pred_class) %>% 
+  pluck(1) %>%
+  as_tibble() %>%
+  ggplot(aes(Truth, Prediction, alpha = n)) +
+  geom_tile(show.legend = FALSE, fill = "blue") +
+  geom_text(aes(label = n), colour = "#2F423D", alpha = 1, size = 7) +
+  scale_x_discrete(position = "top", limits = c("1","0"))
+
+
+
+```
+
+```{r}
+bays_auc<-
+  collect_predictions(xgb_fit) %>% 
+  roc_curve(Churn, .pred_0)
+
+autoplot(bays_ruc)
+```
+```{r}
+vip(xgb_fit %>% extract_fit_parsnip(), geom = "point", num_features = 12) +
+  theme_bw()
+```
+
+## **simulated annealing**
+
+```{r}
+#xgb_tune2 <- tune_sa(
+ # xgb_wf,
+  #resamples = vfold_cv(data_train, v = 5, strata = Churn),
+  #grid = grid,
+  #control = control_sa(),
+  #metric = metric_set(roc_auc, accuracy, f_meas),
+  #seed = 123
+#)
+library(finetune)
+# Create a tune specification
+
+#tune_spec <- tune_grid(
+ # xgb_model,
+  #resamples = vfold_cv(data_train, v = 5, strata = Churn),
+  #grid = grid,
+  #metrics = metric_set(roc_auc, accuracy, f_meas),
+  #preprocessor = data_recipe
+#)
+
+doParallel::registerDoParallel(cores = 8)
+# Perform tuning using simulated annealing
+xgb_tuned2 <- tune_sim_anneal(
+  xgb_wf,param_info = xgb_param,
+  resamples = vfold_cv(data_train, v = 5, strata = Churn),
+  initial = 10,
+  control = control_sim_anneal(verbose = T)
+  #seed = 123
+)
+```
+collect best tune 
+```{r}
+best <- xgb_tuned2 %>% select_best(metric = "accuracy", "roc_auc")
+best
+
+#finalize wf
+xgb_wf3 <- xgb_wf %>% finalize_workflow(best)
+xgb_wf3
+
+```
+model fitting result 
+```{r}
+xgb_fit2 <- xgb_wf3 %>% last_fit(data_split)
+xgb_fit2 %>% collect_metrics()
+```
+```{r}
+autoplot(xgb_tuned2)
+autoplot(xgb_tuned2, type = "performance")
+```
+
+```{r}
+collect_predictions(xgb_fit2)
+```
+conf matrix 
+```{r}
+collect_predictions(xgb_fit2) %>% 
+  conf_mat(Churn, .pred_class) %>% 
+  pluck(1) %>%
+  as_tibble() %>%
+  ggplot(aes(Truth, Prediction, alpha = n)) +
+  geom_tile(show.legend = FALSE, fill = "blue") +
+  geom_text(aes(label = n), colour = "#2F423D", alpha = 1, size = 7) +
+  scale_x_discrete(position = "top", limits = c("1","0"))
+```
+```{r}
+
+SA_auc <-
+  collect_predictions(xgb_fit2) %>% 
+  roc_curve(Churn, .pred_0)  
+  
+
+autoplot(SA_auc)
+
+#SA_auc <- 
+ # xgb_fit2 %>% 
+  #collect_predictions() %>% 
+  #roc_curve(Churn, .pred_0) %>% 
+  #mutate(model = "xgboost")
+
+#autoplot(SA_auc)
+```
+```{r}
+vip(xgb_fit2 %>% extract_fit_parsnip(), geom = "point", num_features = 12) +
+  theme_bw()
+```
+
+```{r}
+library(ggplot2)
+
+# Extract the tuning parameters from xgb_tuned2
+param_values <- extract_values(xgb_tuned2)
+
+# Create a data frame with the parameter values
+df <- data.frame(
+  Param1 = param_values$Param1,
+  Param2 = param_values$Param2
+)
+
+# Generate a plot
+ggplot(df, aes(x = Param1, y = Param2)) +
+  geom_point() +
+  geom_text(aes(label = seq_along(Param1)), size = 3, vjust = -0.5) +
+  labs(x = "Parameter 1", y = "Parameter 2") +
+  theme_bw()
+
+```
+
+## **racing**
+
+```{r}
+data_cv <- vfold_cv(data_train, v = 15, strata = Churn)
+
+doParallel::registerDoParallel(cores = 8)
+xgb_tuned3 <- 
+  xgb_wf %>% 
+  tune_race_anova(
+    xgb_wf,param_info = xgb_param,
+    resamples = data_cv, 
+    initial= 10,         
+    control = control_race(verbose_elim = T, save_pred = T))
+
+autoplot(xgb_tuned3)
+
+plot_race(xgb_tuned3)
+
+
+
+```
+collect best tune race
+```{r}
+best <- xgb_tuned3 %>% select_best(metric = "accuracy")
+best
+
+#finalize wf
+xgb_wf_race <- xgb_wf %>% finalize_workflow(best)
+xgb_wf_race
+```
+
+model fitting result 
+```{r}
+xgb_fit3 <- xgb_wf_race %>% last_fit(data_split)
+xgb_fit3 %>% collect_metrics()
+```
+
+```{r}
+collect_predictions(xgb_fit3)
+```
+
+conf matrix 
+```{r}
+collect_predictions(xgb_fit3) %>% 
+  conf_mat(Churn, .pred_class) %>% 
+  pluck(1) %>%
+  as_tibble() %>%
+  ggplot(aes(Truth, Prediction, alpha = n)) +
+  geom_tile(show.legend = FALSE, fill = "blue") +
+  geom_text(aes(label = n), colour = "#2F423D", alpha = 1, size = 7) +
+  scale_x_discrete(position = "top", limits = c("1","0"))
+```
+
+ROc curve
+```{r}
+race_auc<-
+  collect_predictions(xgb_fit3) %>% 
+  roc_curve(Churn, .pred_0)
+autoplot(race_auc)
+```
+
+plot comparative
+```{r}
+race_auc$.id <- "race_auc"
+SA_auc$.id <- "SA_auc"
+bays_auc$.id <- "bays_auc"
+
+
+bind_rows(race_auc, SA_auc, bays_auc,) %>% 
+  ggplot(aes(x = 1 - specificity, y = sensitivity, col = .id)) + 
+  geom_path(linewidth = 1, alpha = 0.6) +
+  geom_abline(lty = 1) + 
+  coord_equal() + 
+  scale_color_viridis_d(option = "plasma") +
+  theme_bw()
+
+```
+
+```{r}
+
+vip(xgb_fit3 %>% extract_fit_parsnip(), geom = "point", num_features = 12) +
+  theme_bw()
+
+```
+
